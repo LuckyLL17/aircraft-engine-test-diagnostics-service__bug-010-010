@@ -21,9 +21,9 @@ function quantile(values: number[], probability: number): number | null {
   return values[lower] + (values[upper] - values[lower]) * (index - lower);
 }
 
+// Cholesky factor of the validated matrix [[1, rho], [rho, 1]]: the result keeps unit variance and exact correlation rho with z1.
 function correlatedShock(z1: number, z2: number, correlation: number): number {
-  const bounded = Math.max(-0.999999, Math.min(0.999999, correlation));
-  return bounded * z1 + Math.sqrt(1 - Math.abs(bounded)) * z2;
+  return correlation * z1 + Math.sqrt(1 - correlation * correlation) * z2;
 }
 
 function healthLoss(input: LifeModelInput): number {
@@ -46,17 +46,19 @@ export function estimateRemainingLife(input: LifeModelInput): LifeEstimate {
   const life: number[] = [];
   const rejectedReasons: Record<string, number> = {};
   const stress = 1 + Math.max(0, input.temperatureStress) + Math.max(0, input.vibrationStress);
-  const loss = healthLoss(input);
+  const remainingMargin = Math.max(0, input.failureThreshold - healthLoss(input));
+  let failedWithinHorizon = 0;
   for (let sample = 0; sample < input.samples; sample += 1) {
     const z1 = normal(random);
     const z2 = normal(random);
     const rate = degradationRate(input, z1, z2);
     if (!(rate > 0) || !Number.isFinite(rate)) { rejectedReasons.invalidDegradation = (rejectedReasons.invalidDegradation ?? 0) + 1; continue; }
-    const failureAt = (input.failureThreshold - loss) / (rate * stress);
-    if (!(failureAt > 0) || !Number.isFinite(failureAt)) { rejectedReasons.invalidLife = (rejectedReasons.invalidLife ?? 0) + 1; continue; }
+    const failureAt = remainingMargin / (rate * stress);
+    if (!(failureAt >= 0) || !Number.isFinite(failureAt)) { rejectedReasons.invalidLife = (rejectedReasons.invalidLife ?? 0) + 1; continue; }
+    // Samples truncated to the horizon are censored: they enter the quantiles at the window end but never count as failures inside it.
+    if (failureAt < input.horizonHours) failedWithinHorizon += 1;
     life.push(Math.min(input.horizonHours, failureAt));
   }
   life.sort((a, b) => a - b);
-  const failedWithinHorizon = life.filter((hours) => hours < input.horizonHours).length;
-  return { quantiles: { p05: quantile(life, 0.05), p50: quantile(life, 0.5), p95: quantile(life, 0.95) }, failureProbability: input.samples ? failedWithinHorizon / input.samples : 0, validSamples: life.length, rejectedSamples: input.samples - life.length, rejectedReasons };
+  return { quantiles: { p05: quantile(life, 0.05), p50: quantile(life, 0.5), p95: quantile(life, 0.95) }, failureProbability: life.length ? failedWithinHorizon / life.length : 0, validSamples: life.length, rejectedSamples: input.samples - life.length, rejectedReasons };
 }

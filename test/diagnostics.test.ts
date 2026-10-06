@@ -33,3 +33,43 @@ test('life estimate is reproducible for a fixed seed', () => {
   const input = { initialHealth: { compressorEfficiency: 0.95, turbineFlowCapacity: 0.96, bearingFriction: 0.02, hotSectionMargin: 0.9, elapsedHours: 100, version: 1 }, horizonHours: 10_000, samples: 100, seed: 42, meanDegradationPerHour: 0.0002, deviation: 0.00003, temperatureStress: 0.2, vibrationStress: 0.1, failureThreshold: 0.4, correlation: [[1, 0.3], [0.3, 1]] as [[number, number], [number, number]] };
   assert.deepEqual(estimateRemainingLife(input), estimateRemainingLife(input));
 });
+
+const lifeInput = (overrides: Record<string, unknown> = {}) => ({ initialHealth: { compressorEfficiency: 0.95, turbineFlowCapacity: 0.96, bearingFriction: 0.02, hotSectionMargin: 0.9, elapsedHours: 100, version: 1 }, horizonHours: 10_000, samples: 2_000, seed: 7, meanDegradationPerHour: 0.0002, deviation: 0.00003, temperatureStress: 0.2, vibrationStress: 0.1, failureThreshold: 0.4, correlation: [[1, 0.3], [0.3, 1]] as [[number, number], [number, number]], ...overrides });
+
+test('life estimate conserves sample accounting and quantiles', () => {
+  const input = lifeInput();
+  const result = estimateRemainingLife(input);
+  assert.equal(result.validSamples + result.rejectedSamples, input.samples);
+  assert.equal(Object.values(result.rejectedReasons).reduce((sum, count) => sum + count, 0), result.rejectedSamples);
+  const { p05, p50, p95 } = result.quantiles;
+  assert.ok(p05 !== null && p50 !== null && p95 !== null);
+  assert.ok(p05 <= p50 && p50 <= p95);
+  assert.ok(p05 >= 0 && p95 <= input.horizonHours);
+  assert.ok(result.failureProbability >= 0 && result.failureProbability <= 1);
+});
+
+test('life estimate does not count horizon-censored samples as failures', () => {
+  const input = lifeInput({ horizonHours: 5 });
+  const result = estimateRemainingLife(input);
+  assert.equal(result.validSamples, input.samples);
+  assert.equal(result.rejectedSamples, 0);
+  assert.equal(result.failureProbability, 0);
+  assert.equal(result.quantiles.p05, 5);
+  assert.equal(result.quantiles.p95, 5);
+});
+
+test('life estimate reflects the correlation matrix in the sampled spread', () => {
+  const positive = estimateRemainingLife(lifeInput({ samples: 4_000, seed: 11, correlation: [[1, 0.95], [0.95, 1]] }));
+  const negative = estimateRemainingLife(lifeInput({ samples: 4_000, seed: 11, correlation: [[1, -0.95], [-0.95, 1]] }));
+  assert.notDeepEqual(positive.quantiles, negative.quantiles);
+  const spread = (quantiles: { p05: number | null; p95: number | null }) => (quantiles.p95 ?? 0) - (quantiles.p05 ?? 0);
+  assert.ok(spread(positive.quantiles) > spread(negative.quantiles));
+});
+
+test('life estimate treats health already beyond the threshold as failed', () => {
+  const input = lifeInput({ initialHealth: { compressorEfficiency: 0.5, turbineFlowCapacity: 0.9, bearingFriction: 0.05, hotSectionMargin: 0.4, elapsedHours: 900, version: 3 } });
+  const result = estimateRemainingLife(input);
+  assert.equal(result.rejectedSamples, 0);
+  assert.equal(result.failureProbability, 1);
+  assert.equal(result.quantiles.p50, 0);
+});
