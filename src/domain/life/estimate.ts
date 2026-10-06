@@ -12,18 +12,21 @@ function normal(random: () => number): number {
   return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
 }
 
-function quantile(values: number[], probability: number): number | null {
-  if (!values.length) return null;
-  const index = (values.length - 1) * probability;
-  const lower = Math.floor(index);
-  const upper = Math.ceil(index);
-  if (lower === upper) return values[lower];
-  return values[lower] + (values[upper] - values[lower]) * (index - lower);
+// Cholesky factor of [[1, rho], [rho, 1]]: maps independent standard normals to a standard normal pair with correlation rho.
+function correlatedPair(z1: number, z2: number, correlation: [[number, number], [number, number]]): [number, number] {
+  const rho = correlation[0][1];
+  return [z1, rho * z1 + Math.sqrt(1 - rho * rho) * z2];
 }
 
-function correlatedShock(z1: number, z2: number, correlation: number): number {
-  const bounded = Math.max(-0.999999, Math.min(0.999999, correlation));
-  return bounded * z1 + Math.sqrt(1 - Math.abs(bounded)) * z2;
+// Censored draws exceed every observed failure, so a quantile is identifiable only while its sample index stays inside the observed failures.
+function lifeQuantile(sortedFailures: number[], validSamples: number, probability: number): number | null {
+  if (!sortedFailures.length || validSamples < 1) return null;
+  const index = (validSamples - 1) * probability;
+  if (index > sortedFailures.length - 1) return null;
+  const lower = Math.floor(index);
+  const upper = Math.ceil(index);
+  if (lower === upper) return sortedFailures[lower];
+  return sortedFailures[lower] + (sortedFailures[upper] - sortedFailures[lower]) * (index - lower);
 }
 
 function healthLoss(input: LifeModelInput): number {
@@ -32,8 +35,8 @@ function healthLoss(input: LifeModelInput): number {
   return efficiencyLoss + flowLoss + Math.max(0, input.initialHealth.bearingFriction);
 }
 
-function degradationRate(input: LifeModelInput, z1: number, z2: number): number {
-  const shock = 0.5 * z1 + 0.5 * correlatedShock(z1, z2, input.correlation[0][1]);
+function degradationRate(input: LifeModelInput, rateShock: number, stressShock: number): number {
+  const shock = 0.5 * rateShock + 0.5 * stressShock;
   return input.meanDegradationPerHour + input.deviation * shock;
 }
 
@@ -43,20 +46,24 @@ export function estimateRemainingLife(input: LifeModelInput): LifeEstimate {
   invariant(Math.abs(input.correlation[0][0] - 1) < 1e-9 && Math.abs(input.correlation[1][1] - 1) < 1e-9, 'INVALID_CORRELATION', 'Correlation diagonal must equal one');
   invariant(Math.abs(input.correlation[0][1]) < 1 && Math.abs(input.correlation[1][0]) < 1 && input.correlation[0][1] === input.correlation[1][0], 'INVALID_CORRELATION', 'Correlation matrix must be symmetric and bounded');
   const random = rng(input.seed);
-  const life: number[] = [];
-  const rejectedReasons: Record<string, number> = {};
   const stress = 1 + Math.max(0, input.temperatureStress) + Math.max(0, input.vibrationStress);
-  const loss = healthLoss(input);
+  const remaining = input.failureThreshold - healthLoss(input);
+  const failures: number[] = [];
+  let censoredSamples = 0;
+  const rejectedReasons: Record<string, number> = {};
   for (let sample = 0; sample < input.samples; sample += 1) {
     const z1 = normal(random);
     const z2 = normal(random);
-    const rate = degradationRate(input, z1, z2);
+    const [rateShock, stressShock] = correlatedPair(z1, z2, input.correlation);
+    const rate = degradationRate(input, rateShock, stressShock);
     if (!(rate > 0) || !Number.isFinite(rate)) { rejectedReasons.invalidDegradation = (rejectedReasons.invalidDegradation ?? 0) + 1; continue; }
-    const failureAt = (input.failureThreshold - loss) / (rate * stress);
-    if (!(failureAt > 0) || !Number.isFinite(failureAt)) { rejectedReasons.invalidLife = (rejectedReasons.invalidLife ?? 0) + 1; continue; }
-    life.push(Math.min(input.horizonHours, failureAt));
+    const failureAt = remaining / (rate * stress);
+    if (!Number.isFinite(failureAt)) { rejectedReasons.invalidLife = (rejectedReasons.invalidLife ?? 0) + 1; continue; }
+    const hours = Math.max(0, failureAt);
+    if (hours <= input.horizonHours) failures.push(hours);
+    else censoredSamples += 1;
   }
-  life.sort((a, b) => a - b);
-  const failedWithinHorizon = life.filter((hours) => hours < input.horizonHours).length;
-  return { quantiles: { p05: quantile(life, 0.05), p50: quantile(life, 0.5), p95: quantile(life, 0.95) }, failureProbability: input.samples ? failedWithinHorizon / input.samples : 0, validSamples: life.length, rejectedSamples: input.samples - life.length, rejectedReasons };
+  failures.sort((a, b) => a - b);
+  const validSamples = failures.length + censoredSamples;
+  return { quantiles: { p05: lifeQuantile(failures, validSamples, 0.05), p50: lifeQuantile(failures, validSamples, 0.5), p95: lifeQuantile(failures, validSamples, 0.95) }, failureProbability: validSamples ? failures.length / validSamples : 0, validSamples, rejectedSamples: input.samples - validSamples, rejectedReasons };
 }
